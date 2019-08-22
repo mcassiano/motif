@@ -19,9 +19,10 @@ import com.squareup.javapoet.ClassName
 import com.squareup.javapoet.MethodSpec
 import com.squareup.javapoet.TypeName
 import com.squareup.javapoet.TypeSpec
+import motif.ast.IrClass
+import motif.ast.IrMethod
 import motif.core.ResolvedGraph
-import motif.models.Scope
-import motif.models.Type
+import motif.models.*
 import java.util.*
 import javax.lang.model.element.Modifier
 
@@ -50,6 +51,9 @@ class Dependencies private constructor(
 
     class Method(val type: Type, val methodSpec: MethodSpec)
 
+    data class Requester(val callerQualifiedName: String, val callerMethodName: String)
+    data class TypeAndRequesters(val type: Type, val requesters: List<Requester>)
+
     companion object {
 
         fun create(
@@ -60,15 +64,15 @@ class Dependencies private constructor(
             val nameScope = NameScope()
             val typeName = scopeImplTypeName.nestedClass("Dependencies")
 
-            val methods: SortedMap<Type, Method> = sinks
-                    .map { it.type }
-                    .toSet()
-                    .associateWith { type ->
-                        val methodSpec = methodSpec(nameScope, type)
+            val methods: SortedMap<Type, Method> = getRequestersByType(sinks)
+                    .map { typeAndRequesters ->
+                        val methodSpec = methodSpec(nameScope, typeAndRequesters.type)
                                 .addModifiers(Modifier.PUBLIC, Modifier.ABSTRACT)
+                                .addJavadoc(getJavadocForType(typeAndRequesters.requesters))
                                 .build()
-                        Method(type, methodSpec)
+                        Method(typeAndRequesters.type, methodSpec)
                     }
+                    .associateBy { it.type }
                     .toSortedMap()
 
             val typeSpec = TypeSpec.interfaceBuilder(typeName)
@@ -77,6 +81,42 @@ class Dependencies private constructor(
                     .build()
 
             return Dependencies(typeSpec, typeName, methods)
+        }
+
+        private fun getRequestersByType(sinks: Iterable<Sink>): Iterable<TypeAndRequesters> {
+            return sinks
+                    .groupBy { it.type }
+                    .mapValues { sinksByType ->
+                        val requesters = sinksByType.value.map { sink ->
+                            when (sink) {
+                                is FactoryMethodSink -> Requester(
+                                        sink.parameter.owner.qualifiedName,
+                                        inspectAndReturnMethodName(sink.parameter.owner, sink.parameter.method))
+                                is AccessMethodSink -> Requester(
+                                        sink.accessMethod.scope.qualifiedName,
+                                        sink.accessMethod.method.name)
+                            }
+                        }
+                        TypeAndRequesters(sinksByType.key, requesters)
+                    }
+                    .values
+        }
+
+        private fun getJavadocForType(requesters: List<Requester>): String {
+            val requestersHtmlItems = requesters.joinToString(separator = "\n") { requester ->
+                "<li>{@link ${requester.callerQualifiedName}#${requester.callerMethodName}}</li>"
+            }
+            return "<ul>Requested from:\n$requestersHtmlItems\n</ul>"
+        }
+
+        private fun inspectAndReturnMethodName(owner: IrClass, method: IrMethod): String {
+            if (!"<init>".contentEquals(method.name)) {
+                return method.name
+            }
+
+            // we have a constructor
+            val paramList = method.parameters.joinToString(separator = ",") { parameter -> parameter.type.qualifiedName }
+            return "${owner.simpleName}($paramList)"
         }
     }
 }
